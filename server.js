@@ -9,7 +9,7 @@ app.use(cookieParser());
 
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123"; // ganti via ENV
 
-// =============== Session helpers ===============
+// ====================== Session helpers ======================
 function createSession(member_id, hours = 72) {
   const token = crypto.randomBytes(24).toString("hex");
   const expires = new Date(Date.now() + hours * 3600 * 1000).toISOString();
@@ -37,7 +37,7 @@ function requireLoginApi(req, res, next) {
   next();
 }
 
-// =============== Admin auth ===============
+// ====================== Admin auth ======================
 function isAdmin(req) {
   return req.cookies?.admin === "1";
 }
@@ -46,7 +46,7 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// =============== Points helpers ===============
+// ====================== Points helpers ======================
 function getHeldByMember(memberId) {
   return db.prepare("SELECT COALESCE(SUM(amount),0) AS held FROM holds WHERE member_id=?").get(memberId).held;
 }
@@ -58,19 +58,82 @@ function getCurrentHold(itemId) {
   return db.prepare("SELECT * FROM holds WHERE item_id=?").get(itemId);
 }
 
-// =============== Deadline helpers ===============
+// ====================== Deadline helpers ======================
 function getDeadlineUtc() {
   return db.prepare("SELECT value FROM settings WHERE key='bid_deadline_utc'").get()?.value || "";
 }
+
+// selalu kembalikan ISO berakhiran Z, atau null jika tidak valid
+function getDeadlineIsoOrNull() {
+  const v = getDeadlineUtc();
+  if (!v) return null;
+  const t = Date.parse(v);
+  if (Number.isNaN(t)) return null;
+  return new Date(t).toISOString();
+}
+
+// versi robust: jika string ISO tanpa timezone, paksa Z
 function isBidClosedByDeadline() {
   const v = getDeadlineUtc();
   if (!v) return false;
-  const t = Date.parse(v); // v should be ISO
+
+  let t = Date.parse(v);
+
+  // jika gagal parse & bentuknya seperti ISO tanpa timezone => tambah Z
+  if (Number.isNaN(t)) {
+    const looksIsoNoTz = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(v) && !(/[zZ]|[+\-]\d{2}:\d{2}$/.test(v));
+    if (looksIsoNoTz) t = Date.parse(v + "Z");
+  }
+
   if (Number.isNaN(t)) return false;
-  return Date.now() > t;
+
+  // >= supaya tepat di detik deadline langsung tertutup
+  return Date.now() >= t;
 }
 
-// =============== API base ===============
+// ====================== Auto finalize after deadline ======================
+// - saat deadline lewat, semua item OPEN:
+//   - kalau punya hold -> masuk finals + potong poin + hapus hold
+//   - kalau tidak punya hold -> tetap ditutup (CLOSED) agar bersih
+// - finalized_at = tepat waktu deadline (settle time)
+function autoFinalizeAllIfDeadlinePassed() {
+  if (!isBidClosedByDeadline()) return { ran: false, finalized: 0 };
+
+  const deadlineIso = getDeadlineIsoOrNull() || new Date().toISOString();
+
+  // Ambil semua item OPEN yang punya hold dan belum ada finals
+  const rows = db.prepare(`
+    SELECT i.id AS item_id, i.name AS item_name,
+           h.member_id AS winner_member_id, h.amount AS amount
+    FROM items i
+    JOIN holds h ON h.item_id = i.id
+    LEFT JOIN finals f ON f.item_id = i.id
+    WHERE i.status = 'OPEN' AND f.item_id IS NULL
+    ORDER BY i.created_at DESC
+  `).all();
+
+  const tx = db.transaction(() => {
+    for (const r of rows) {
+      db.prepare(`UPDATE items SET status='CLOSED' WHERE id=?`).run(r.item_id);
+      db.prepare(`UPDATE members SET points_total = points_total - ? WHERE id=?`).run(r.amount, r.winner_member_id);
+
+      db.prepare(`
+        INSERT INTO finals(item_id, winner_member_id, amount, finalized_at)
+        VALUES(?, ?, ?, ?)
+      `).run(r.item_id, r.winner_member_id, r.amount, deadlineIso);
+
+      db.prepare(`DELETE FROM holds WHERE item_id=?`).run(r.item_id);
+    }
+
+    // Tutup semua item yang masih OPEN (termasuk yang tidak punya hold)
+    db.prepare(`UPDATE items SET status='CLOSED' WHERE status='OPEN'`).run();
+  });
+
+  tx();
+  return { ran: true, finalized: rows.length };
+}
+
+// ====================== API base ======================
 app.get("/api/members", (req, res) => {
   res.json(db.prepare("SELECT id, nickname, points_total FROM members ORDER BY nickname").all());
 });
@@ -86,6 +149,9 @@ app.get("/api/settings", requireLoginApi, (req, res) => {
 app.get("/api/me", (req, res) => {
   const s = getSession(req);
   if (!s) return res.json({ logged_in: false });
+
+  // AUTO FINALIZE ketika deadline lewat
+  try { autoFinalizeAllIfDeadlinePassed(); } catch (e) {}
 
   const m = db.prepare("SELECT id, nickname, points_total FROM members WHERE id=?").get(s.member_id);
   if (!m) return res.json({ logged_in: false });
@@ -106,7 +172,7 @@ app.get("/api/me", (req, res) => {
   });
 });
 
-// =============== Login / Logout ===============
+// ====================== Login / Logout ======================
 app.post("/api/login", (req, res) => {
   const { nickname } = req.body;
   if (!nickname) return res.status(400).json({ error: "Nickname wajib." });
@@ -142,8 +208,11 @@ app.post("/api/logout", (req, res) => {
   res.json({ ok: true });
 });
 
-// =============== Dashboard (include finals) ===============
+// ====================== Dashboard (include finals) ======================
 app.get("/api/dashboard", requireLoginApi, (req, res) => {
+  // AUTO FINALIZE ketika deadline lewat
+  try { autoFinalizeAllIfDeadlinePassed(); } catch (e) {}
+
   const members = db.prepare(`
     SELECT m.id, m.nickname, m.points_total,
       COALESCE((SELECT SUM(h.amount) FROM holds h WHERE h.member_id = m.id), 0) AS held_points
@@ -151,10 +220,12 @@ app.get("/api/dashboard", requireLoginApi, (req, res) => {
     ORDER BY m.nickname
   `).all();
 
+  // include highest bid time (real-time) dari bids terbaru per item (UTC)
   const items = db.prepare(`
     SELECT i.id, i.name, i.status,
       h.amount AS highest_amount,
-      mm.nickname AS highest_nickname
+      mm.nickname AS highest_nickname,
+      (SELECT MAX(b.created_at) FROM bids b WHERE b.item_id = i.id) AS highest_time
     FROM items i
     LEFT JOIN holds h ON h.item_id = i.id
     LEFT JOIN members mm ON mm.id = h.member_id
@@ -178,8 +249,11 @@ app.get("/api/dashboard", requireLoginApi, (req, res) => {
   });
 });
 
-// =============== Bid (blocked by deadline) ===============
+// ====================== Bid (blocked by deadline) ======================
 app.post("/api/bid", requireLoginApi, (req, res) => {
+  // auto finalize dulu kalau deadline sudah lewat
+  try { autoFinalizeAllIfDeadlinePassed(); } catch (e) {}
+
   if (isBidClosedByDeadline()) {
     return res.status(403).json({ error: "Bid sudah ditutup karena melewati deadline." });
   }
@@ -201,10 +275,10 @@ app.post("/api/bid", requireLoginApi, (req, res) => {
 
   const currentHold = getCurrentHold(item.id);
   const currentHighest = currentHold ? currentHold.amount : 0;
-  if (amount <= currentHighest) return res.status(400).json({ error: `Bid harus lebih tinggi dari ${currentHighest}.` });
+  if (amount <= currentHighest) return res.status(400).json({ error: "Bid harus lebih tinggi dari " + currentHighest + "." });
 
   const available = getAvailablePoints(member.id);
-  if (amount > available) return res.status(400).json({ error: `Poin tidak cukup. Available kamu: ${available}.` });
+  if (amount > available) return res.status(400).json({ error: "Poin tidak cukup. Available kamu: " + available + "." });
 
   const tx = db.transaction(() => {
     db.prepare("INSERT INTO bids(item_id, member_id, amount) VALUES(?, ?, ?)").run(item.id, member.id, amount);
@@ -218,9 +292,8 @@ app.post("/api/bid", requireLoginApi, (req, res) => {
   res.json({ ok: true, message: "Bid diterima. Kamu jadi pemenang sementara." });
 });
 
-// =============== ADMIN: deadline set/clear ===============
+// ====================== ADMIN: deadline set/clear (UTC+7 input -> store UTC ISO Z) ======================
 app.post("/api/admin/set-deadline", requireLoginApi, requireAdmin, (req, res) => {
-  // expect ISO string, e.g. 2026-01-12T10:00:00.000Z
   const { deadline_utc } = req.body;
   if (typeof deadline_utc !== "string") return res.status(400).json({ error: "deadline_utc wajib string ISO." });
 
@@ -228,13 +301,17 @@ app.post("/api/admin/set-deadline", requireLoginApi, requireAdmin, (req, res) =>
   if (v !== "") {
     const t = Date.parse(v);
     if (Number.isNaN(t)) return res.status(400).json({ error: "deadline_utc tidak valid (ISO)." });
+
+    const normalized = new Date(t).toISOString(); // pastikan ...Z
+    db.prepare("UPDATE settings SET value=? WHERE key='bid_deadline_utc'").run(normalized);
+    return res.json({ ok: true, message: "Deadline disimpan." });
   }
 
-  db.prepare("UPDATE settings SET value=? WHERE key='bid_deadline_utc'").run(v);
-  res.json({ ok: true, message: v ? "Deadline disimpan." : "Deadline dikosongkan." });
+  db.prepare("UPDATE settings SET value=? WHERE key='bid_deadline_utc'").run("");
+  res.json({ ok: true, message: "Deadline dikosongkan." });
 });
 
-// =============== ADMIN: add / delete member & item ===============
+// ====================== ADMIN: add / delete member & item ======================
 app.post("/api/admin/add-member", requireLoginApi, requireAdmin, (req, res) => {
   const { nickname, points_total = 0 } = req.body;
   if (!nickname || typeof nickname !== "string") return res.status(400).json({ error: "nickname wajib (string)." });
@@ -247,7 +324,7 @@ app.post("/api/admin/add-member", requireLoginApi, requireAdmin, (req, res) => {
   } catch (e) {
     return res.status(400).json({ error: "Gagal menambah member (mungkin nickname sudah ada).", detail: String(e.message || e) });
   }
-  res.json({ ok: true, message: `Member ${clean} ditambahkan.` });
+  res.json({ ok: true, message: "Member " + clean + " ditambahkan." });
 });
 
 app.post("/api/admin/delete-member", requireLoginApi, requireAdmin, (req, res) => {
@@ -257,7 +334,6 @@ app.post("/api/admin/delete-member", requireLoginApi, requireAdmin, (req, res) =
   const m = db.prepare("SELECT * FROM members WHERE nickname=?").get(nickname);
   if (!m) return res.status(404).json({ error: "Member tidak ditemukan." });
 
-  // safety: tidak boleh hapus jika ada bid/hold/final
   const hasHold = db.prepare("SELECT 1 FROM holds WHERE member_id=?").get(m.id);
   const hasBid = db.prepare("SELECT 1 FROM bids WHERE member_id=?").get(m.id);
   const hasFinal = db.prepare("SELECT 1 FROM finals WHERE winner_member_id=?").get(m.id);
@@ -267,7 +343,7 @@ app.post("/api/admin/delete-member", requireLoginApi, requireAdmin, (req, res) =
   }
 
   db.prepare("DELETE FROM members WHERE id=?").run(m.id);
-  res.json({ ok: true, message: `Member ${nickname} dihapus.` });
+  res.json({ ok: true, message: "Member " + nickname + " dihapus." });
 });
 
 app.post("/api/admin/add-item", requireLoginApi, requireAdmin, (req, res) => {
@@ -281,7 +357,7 @@ app.post("/api/admin/add-item", requireLoginApi, requireAdmin, (req, res) => {
   } catch (e) {
     return res.status(400).json({ error: "Gagal menambah item (mungkin item sudah ada).", detail: String(e.message || e) });
   }
-  res.json({ ok: true, message: `Item ${clean} ditambahkan (OPEN).` });
+  res.json({ ok: true, message: "Item " + clean + " ditambahkan (OPEN)." });
 });
 
 app.post("/api/admin/delete-item", requireLoginApi, requireAdmin, (req, res) => {
@@ -300,10 +376,31 @@ app.post("/api/admin/delete-item", requireLoginApi, requireAdmin, (req, res) => 
   }
 
   db.prepare("DELETE FROM items WHERE id=?").run(item.id);
-  res.json({ ok: true, message: `Item ${itemName} dihapus.` });
+  res.json({ ok: true, message: "Item " + itemName + " dihapus." });
 });
 
-// =============== ADMIN: set points, finalize, log bids ===============
+// ====================== ADMIN: DELETE ALL ITEMS (bersihkan items + bids + holds + finals) ======================
+app.post("/api/admin/delete-all-items", requireLoginApi, requireAdmin, (req, res) => {
+  // safety confirm via query param optional: ?confirm=YES
+  const confirm = req.query?.confirm;
+  if (confirm !== "YES") {
+    return res.status(400).json({ error: "Tambahkan ?confirm=YES untuk menghapus SEMUA items/bids/holds/finals." });
+  }
+
+  const tx = db.transaction(() => {
+    db.prepare("DELETE FROM holds").run();
+    db.prepare("DELETE FROM bids").run();
+    db.prepare("DELETE FROM finals").run();
+    db.prepare("DELETE FROM items").run();
+  });
+
+  try { tx(); }
+  catch (e) { return res.status(500).json({ error: "Gagal delete all items.", detail: String(e.message || e) }); }
+
+  res.json({ ok: true, message: "Semua items + bids + holds + finals sudah dihapus. Tabel kembali bersih." });
+});
+
+// ====================== ADMIN: set points, finalize, log bids ======================
 app.post("/api/admin/set-points", requireLoginApi, requireAdmin, (req, res) => {
   const { nickname, points_total } = req.body;
   if (!nickname || !Number.isInteger(points_total) || points_total < 0) {
@@ -314,15 +411,20 @@ app.post("/api/admin/set-points", requireLoginApi, requireAdmin, (req, res) => {
   if (!m) return res.status(404).json({ error: "Member tidak ditemukan." });
 
   const held = getHeldByMember(m.id);
-  if (points_total < held) return res.status(400).json({ error: `Tidak bisa set poin < held (${held}).` });
+  if (points_total < held) return res.status(400).json({ error: "Tidak bisa set poin < held (" + held + ")." });
 
   db.prepare("UPDATE members SET points_total=? WHERE id=?").run(points_total, m.id);
-  res.json({ ok: true, message: `Poin ${nickname} di-set menjadi ${points_total}.` });
+  res.json({ ok: true, message: "Poin " + nickname + " di-set menjadi " + points_total + "." });
 });
 
 app.post("/api/admin/finalize", requireLoginApi, requireAdmin, (req, res) => {
   const { itemName } = req.body;
   if (!itemName) return res.status(400).json({ error: "itemName wajib." });
+
+  // setelah deadline lewat, finalize berjalan otomatis
+  if (isBidClosedByDeadline()) {
+    return res.status(400).json({ error: "Deadline sudah lewat. Finalize berjalan otomatis." });
+  }
 
   const item = db.prepare("SELECT * FROM items WHERE name=?").get(itemName);
   if (!item) return res.status(404).json({ error: "Item tidak ditemukan." });
@@ -333,13 +435,17 @@ app.post("/api/admin/finalize", requireLoginApi, requireAdmin, (req, res) => {
   const hold = db.prepare("SELECT * FROM holds WHERE item_id=?").get(item.id);
   if (!hold) return res.status(400).json({ error: "Belum ada pemenang sementara untuk item ini." });
 
+  const deadlineIso = getDeadlineIsoOrNull() || new Date().toISOString();
+
   const tx = db.transaction(() => {
     db.prepare("UPDATE items SET status='CLOSED' WHERE id=?").run(item.id);
     db.prepare("UPDATE members SET points_total = points_total - ? WHERE id=?").run(hold.amount, hold.member_id);
 
-    db.prepare("INSERT INTO finals(item_id, winner_member_id, amount) VALUES(?, ?, ?)").run(
-      item.id, hold.member_id, hold.amount
-    );
+    // finalized_at = settle time (deadline)
+    db.prepare(`
+      INSERT INTO finals(item_id, winner_member_id, amount, finalized_at)
+      VALUES(?, ?, ?, ?)
+    `).run(item.id, hold.member_id, hold.amount, deadlineIso);
 
     db.prepare("DELETE FROM holds WHERE item_id=?").run(item.id);
   });
@@ -369,7 +475,7 @@ app.get("/api/admin/bids", requireLoginApi, requireAdmin, (req, res) => {
   res.json({ ok: true, item: item.name, bids: rows });
 });
 
-// =============== Pages ===============
+// ====================== Pages ======================
 app.get("/login", (req, res) => {
   res.type("html").send(`
 <!doctype html><html lang="id"><head>
@@ -399,7 +505,7 @@ background:linear-gradient(135deg, rgba(124,58,237,0.95), rgba(96,165,250,0.85))
 async function loadMembers(){
   const members = await fetch('/api/members').then(r=>r.json());
   document.getElementById('member').innerHTML = members.sort((a,b)=>a.nickname.localeCompare(b.nickname))
-    .map(m => \`<option value="\${m.nickname}">\${m.nickname}</option>\`).join('');
+    .map(m => '<option value="'+m.nickname+'">'+m.nickname+'</option>').join('');
 }
 async function login(){
   const nickname = document.getElementById('member').value;
@@ -446,7 +552,8 @@ h1{margin:0;font-size:18px}.sub{margin:2px 0 0;color:var(--muted);font-size:12px
 .card-header{padding:16px 18px;border-bottom:1px solid rgba(255,255,255,0.08);display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
 .card-header h2{margin:0;font-size:14px;letter-spacing:0.25px;text-transform:uppercase;color:rgba(255,255,255,0.88)}
 .card-header .desc{margin-top:5px;font-size:12px;color:var(--muted)}
-.badge{display:inline-flex;padding:7px 10px;border-radius:999px;font-size:12px;white-space:nowrap;border:1px solid rgba(34,197,94,0.32);background:rgba(34,197,94,0.12);color:rgba(255,255,255,0.86)}
+.badge{display:inline-flex;padding:7px 10px;border-radius:999px;font-size:12px;white-space:nowrap;border:1px solid rgba(34,197,94,0.32);background:rgba(34,197,94,0.12);color:rgba(255,255,255,0.86);font-weight:900}
+.badgeRed{border-color:rgba(239,68,68,0.42);background:rgba(239,68,68,0.18)}
 .card-body{padding:16px 18px}
 label{display:block;margin:10px 0 6px;font-size:12px;color:var(--muted)}
 select,input{width:100%;padding:10px 10px;border-radius:14px;border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.06);color:var(--text);outline:none}
@@ -463,6 +570,13 @@ select option{background:#111827!important;color:#fff!important}
 table{width:100%;border-collapse:collapse;table-layout:fixed}
 thead th{font-size:11px;text-transform:uppercase;letter-spacing:0.25px;color:rgba(255,255,255,0.82);padding:10px 10px;text-align:left;background:rgba(255,255,255,0.06);border-bottom:1px solid rgba(255,255,255,0.10);white-space:nowrap}
 tbody td{padding:10px 10px;font-size:12px;color:rgba(255,255,255,0.82);border-bottom:1px solid rgba(255,255,255,0.07);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* supaya jam tidak jadi "..." */
+td.colTime{
+  overflow:visible !important;
+  text-overflow:clip !important;
+  white-space:nowrap !important;
+  font-variant-numeric: tabular-nums;
+}
 .right{text-align:right}.divider{height:12px}.footer{margin-top:10px;font-size:12px;color:rgba(255,255,255,0.45);text-align:center}
 .adminBox{margin-top:12px;padding:12px;border-radius:16px;border:1px solid rgba(245,158,11,0.22);background:rgba(245,158,11,0.08);display:none}
 .adminTitle{font-weight:900;margin:0 0 10px;font-size:13px;color:rgba(255,255,255,0.9)}
@@ -507,7 +621,7 @@ tbody td{padding:10px 10px;font-size:12px;color:rgba(255,255,255,0.82);border-bo
           <h2>Place Bid</h2>
           <div class="desc">Pilih item lelang, lalu bid point.</div>
         </div>
-        <span class="badge">AUTO HOLD</span>
+        <span class="badge badgeRed" id="deadlineBadge">-</span>
       </div>
       <div class="card-body">
         <label>Item Lelang</label>
@@ -615,11 +729,13 @@ tbody td{padding:10px 10px;font-size:12px;color:rgba(255,255,255,0.82);border-bo
         <div class="table-wrap">
           <table>
             <thead><tr>
-              <th style="width:40%;">Item</th>
-              <th style="width:18%;">Status</th>
-              <th style="width:24%;">Highest</th>
-              <th class="right" style="width:18%;">Bid</th>
-            </tr></thead>
+  <th style="width:36%;">Item</th>
+  <th style="width:16%;">Status</th>
+  <th style="width:20%;">Highest</th>
+  <th class="right" style="width:14%;">Bid</th>
+  <th style="width:14%;">Time</th>
+</tr></thead>
+
             <tbody id="itemsTbody"></tbody>
           </table>
         </div>
@@ -630,11 +746,12 @@ tbody td{padding:10px 10px;font-size:12px;color:rgba(255,255,255,0.82);border-bo
         <div class="table-wrap">
           <table>
             <thead><tr>
-              <th style="width:42%;">Item</th>
-              <th style="width:28%;">Winner</th>
-              <th class="right" style="width:15%;">Bid</th>
-              <th style="width:15%;">Time</th>
-            </tr></thead>
+  <th style="width:40%;">Item</th>
+  <th style="width:28%;">Winner</th>
+  <th class="right" style="width:14%;">Bid</th>
+  <th style="width:18%;">Time</th>
+</tr></thead>
+
             <tbody id="finalsTbody"></tbody>
           </table>
         </div>
@@ -661,7 +778,12 @@ tbody td{padding:10px 10px;font-size:12px;color:rgba(255,255,255,0.82);border-bo
             <div><select id="delItem"></select></div>
             <div><button class="btn btn-secondary" onclick="deleteItem()">Hapus</button></div>
           </div>
-          <div class="smallNote">Catatan: tidak bisa hapus jika item pernah bid/hold/final.</div>
+
+          <div class="divider"></div>
+
+          <label style="color:rgba(255,255,255,0.85);font-weight:900;">Hapus SEMUA Items (Bersihkan setelah distribusi)</label>
+          <button class="btn btn-secondary" onclick="deleteAllItems()">Delete ALL Items</button>
+          <div class="smallNote">Ini menghapus: items + bids + holds + finals (member tetap ada).</div>
 
           <div class="divider"></div>
 
@@ -694,7 +816,7 @@ tbody td{padding:10px 10px;font-size:12px;color:rgba(255,255,255,0.82);border-bo
 
           <div class="row">
             <div>
-              <label>Deadline Close Bid (UTC+8)</label>
+              <label>Deadline Close Bid (UTC+7)</label>
               <input id="deadlineLocal" type="datetime-local"/>
             </div>
             <div>
@@ -708,7 +830,7 @@ tbody td{padding:10px 10px;font-size:12px;color:rgba(255,255,255,0.82);border-bo
           <button class="btn btn-secondary" onclick="adminLogout()">Keluar Admin Mode</button>
         </div>
 
-        <div class="footer">Auto refresh setiap 10 detik.</div>
+        <div class="footer">Auto refresh tabel setiap 10 detik (tidak mengganggu form admin).</div>
       </div>
     </div>
   </div>
@@ -721,43 +843,59 @@ function toast(type, msg){
   const el = document.getElementById("toast");
   el.className = "toast " + (type === "ok" ? "ok" : "err");
   el.textContent = msg;
-  setTimeout(()=>{ el.className="toast"; el.textContent=""; }, 3200);
+  setTimeout(function(){ el.className="toast"; el.textContent=""; }, 3200);
 }
 
-function timeNow(){ return new Date().toLocaleTimeString('id-ID', { hour12:false }); }
+function pad2(n){ return String(n).padStart(2,'0'); }
 
-function toUtcIsoFromUtc8LocalInput(localVal){
-  // localVal: "YYYY-MM-DDTHH:mm" (anggap itu UTC+8)
+function timeNowUtc7(){
+  // tampil "HH:MM:SS" UTC+7
+  const d = new Date(Date.now() + 7*3600*1000);
+  return pad2(d.getUTCHours()) + ":" + pad2(d.getUTCMinutes()) + ":" + pad2(d.getUTCSeconds());
+}
+
+function toUtcIsoFromUtc7LocalInput(localVal){
+  // localVal: "YYYY-MM-DDTHH:mm" (anggap itu UTC+7) => simpan sebagai UTC ISO Z
   if(!localVal) return "";
-  const [datePart, timePart] = localVal.split("T");
-  const [y,m,d] = datePart.split("-").map(Number);
-  const [hh,mm] = timePart.split(":").map(Number);
-  // Ini dianggap waktu UTC+8, maka UTC = (hh-8)
-  const utcMs = Date.UTC(y, m-1, d, hh-8, mm, 0);
+  const parts = localVal.split("T");
+  const datePart = parts[0];
+  const timePart = parts[1];
+  const ymd = datePart.split("-").map(Number);
+  const hm = timePart.split(":").map(Number);
+  const y = ymd[0], m = ymd[1], d = ymd[2];
+  const hh = hm[0], mm = hm[1];
+  const utcMs = Date.UTC(y, m-1, d, hh-7, mm, 0);
   return new Date(utcMs).toISOString();
 }
 
-function toUtc8Display(utcIso){
+function toUtc7Display(utcIso){
   if(!utcIso) return "";
   const ms = Date.parse(utcIso);
   if(Number.isNaN(ms)) return "";
-  const d = new Date(ms + 8*3600*1000);
-  // tampilkan format ringkas
-  const pad = (n)=>String(n).padStart(2,'0');
-  return \`\${d.getUTCFullYear()}-\${pad(d.getUTCMonth()+1)}-\${pad(d.getUTCDate())} \${pad(d.getUTCHours())}:\${pad(d.getUTCMinutes())} (UTC+8)\`;
+  const d = new Date(ms + 7*3600*1000);
+  return pad2(d.getUTCDate()) + "/" + pad2(d.getUTCMonth()+1) + ", " + pad2(d.getUTCHours()) + ":" + pad2(d.getUTCMinutes());
 }
 
-function toUtc8InputValue(utcIso){
+function toUtc7InputValue(utcIso){
   if(!utcIso) return "";
   const ms = Date.parse(utcIso);
   if(Number.isNaN(ms)) return "";
-  const d = new Date(ms + 8*3600*1000);
-  const pad = (n)=>String(n).padStart(2,'0');
-  return \`\${d.getUTCFullYear()}-\${pad(d.getUTCMonth()+1)}-\${pad(d.getUTCDate())}T\${pad(d.getUTCHours())}:\${pad(d.getUTCMinutes())}\`;
+  const d = new Date(ms + 7*3600*1000);
+  return d.getUTCFullYear() + "-" + pad2(d.getUTCMonth()+1) + "-" + pad2(d.getUTCDate()) + "T" + pad2(d.getUTCHours()) + ":" + pad2(d.getUTCMinutes());
+}
+
+function toUtc7HHMM(dt){
+  // dt bisa: "YYYY-MM-DD HH:mm:ss" (sqlite) atau "YYYY-MM-DDTHH:mm:ss.sssZ" (ISO)
+  if(!dt) return "-";
+  var iso = dt.indexOf("T") >= 0 ? dt : (dt.replace(" ", "T") + "Z");
+  var ms = Date.parse(iso);
+  if(Number.isNaN(ms)) return "-";
+  var d = new Date(ms + 7*3600*1000);
+  return pad2(d.getUTCHours()) + ":" + pad2(d.getUTCMinutes());
 }
 
 async function loadMe(){
-  const me = await fetch('/api/me').then(r=>r.json());
+  const me = await fetch('/api/me').then(function(r){ return r.json(); });
   if(!me.logged_in){ location.href='/login'; return null; }
   ME = me;
   document.getElementById("who").textContent = me.member.nickname;
@@ -766,17 +904,26 @@ async function loadMe(){
   // deadline bar + disable bid
   const bar = document.getElementById("deadlineBar");
   const btn = document.getElementById("bidBtn");
-  const deadlineTxt = me.bid_deadline_utc ? toUtc8Display(me.bid_deadline_utc) : "";
+
+  // badge merah (di header Place Bid)
+  const badge = document.getElementById("deadlineBadge");
   if(me.bid_deadline_utc){
+    badge.textContent = toUtc7Display(me.bid_deadline_utc);
+  }else{
+    badge.textContent = "-";
+  }
+
+  if(me.bid_deadline_utc){
+    var deadlineTxt = toUtc7Display(me.bid_deadline_utc);
     if(me.bid_closed){
       bar.style.display = "block";
-      bar.innerHTML = \`BID CLOSED (Deadline lewat)\n<small>Deadline: \${deadlineTxt}</small>\`;
+      bar.innerHTML = "BID CLOSED (Deadline lewat)<small>Deadline: " + deadlineTxt + " (UTC+7)</small>";
       btn.disabled = true;
       btn.style.opacity = 0.5;
       btn.style.cursor = "not-allowed";
     }else{
       bar.style.display = "block";
-      bar.innerHTML = \`Deadline Bid: \${deadlineTxt}\n<small>Jika lewat deadline, semua bid otomatis berhenti.</small>\`;
+      bar.innerHTML = "Deadline Bid: " + deadlineTxt + " (UTC+7)<small>Jika lewat deadline, semua bid otomatis berhenti & auto-finalize.</small>";
       btn.disabled = false;
       btn.style.opacity = 1;
       btn.style.cursor = "pointer";
@@ -792,70 +939,94 @@ async function loadMe(){
   document.getElementById("adminLeft").style.display = me.is_admin ? "block" : "none";
   document.getElementById("adminRight").style.display = me.is_admin ? "block" : "none";
 
-  // sync deadline input for admin
+  // sync deadline input for admin (UTC+7)
   if(me.is_admin){
-    document.getElementById("deadlineLocal").value = toUtc8InputValue(me.bid_deadline_utc || "");
+    document.getElementById("deadlineLocal").value = toUtc7InputValue(me.bid_deadline_utc || "");
   }
-
   return me;
 }
 
 async function loadOptions(){
-  const items = await fetch('/api/items').then(r=>r.json());
-  document.getElementById('item').innerHTML = items.filter(i=>i.status==='OPEN')
-    .map(i=>\`<option value="\${i.name}">\${i.name}</option>\`).join('');
+  const items = await fetch('/api/items').then(function(r){ return r.json(); });
+  document.getElementById('item').innerHTML = items.filter(function(i){ return i.status==='OPEN'; })
+    .map(function(i){ return '<option value="'+i.name+'">'+i.name+'</option>'; }).join('');
 }
 
-function quickSet(){ document.getElementById('amount').value = parseInt(document.getElementById('quick').value,10); }
+function quickSet(){
+  document.getElementById('amount').value = parseInt(document.getElementById('quick').value,10);
+}
 
-async function loadDashboard(){
-  const data = await fetch('/api/dashboard').then(r=>r.json());
+function updateHighestForSelectedItem(){
+  const itemName = document.getElementById('item').value;
+  const found = DASH && DASH.items ? DASH.items.find(function(x){ return x.name===itemName; }) : null;
+  document.getElementById("highest").textContent =
+    (found && found.highest_amount) ? (found.highest_amount + " (" + found.highest_nickname + ")") : "-";
+}
+
+function populateAdminDropdowns(){
+  const members = DASH && DASH.members ? DASH.members : [];
+  const itemsAll = DASH && DASH.items ? DASH.items : [];
+  const itemsOpen = itemsAll.filter(function(i){ return i.status==="OPEN"; });
+
+  const memOptions = members.map(function(m){ return '<option value="'+m.nickname+'">'+m.nickname+'</option>'; }).join("");
+  document.getElementById("adminMember").innerHTML = memOptions;
+  document.getElementById("delMember").innerHTML = memOptions;
+
+  document.getElementById("finalizeItem").innerHTML = itemsOpen.map(function(i){ return '<option value="'+i.name+'">'+i.name+'</option>'; }).join("");
+  document.getElementById("delItem").innerHTML = itemsAll.map(function(i){ return '<option value="'+i.name+'">'+i.name+'</option>'; }).join("");
+}
+
+async function loadBidLog(){
+  const el = document.getElementById("finalizeItem");
+  const tbody = document.getElementById("logTbody");
+  if(!tbody) return;
+  const itemName = el ? el.value : "";
+  if(!itemName){ tbody.innerHTML = '<tr><td colspan="3">Pilih item OPEN untuk melihat log.</td></tr>'; return; }
+
+  const resp = await fetch('/api/admin/bids?itemName='+encodeURIComponent(itemName));
+  const data = await resp.json();
+  if(!resp.ok){ tbody.innerHTML = '<tr><td colspan="3">Gagal memuat log.</td></tr>'; return; }
+
+  tbody.innerHTML = (data.bids||[]).map(function(b){
+    return '<tr><td title="'+b.created_at+'">'+b.created_at+'</td><td title="'+b.nickname+'"><strong>'+b.nickname+'</strong></td><td class="right">'+b.amount+'</td></tr>';
+  }).join("") || '<tr><td colspan="3">Belum ada bid.</td></tr>';
+}
+
+// tablesOnly:
+// - true  => hanya update tabel + timestamp, TIDAK update dropdown/input admin + TIDAK load log
+// - false => full update (untuk manual refresh)
+async function loadDashboard(tablesOnly){
+  const data = await fetch('/api/dashboard').then(function(r){ return r.json(); });
   DASH = data;
 
-  document.getElementById("membersTbody").innerHTML = data.members.map(m=>\`
-    <tr>
-      <td title="\${m.nickname}"><strong>\${m.nickname}</strong></td>
-      <td class="right">\${m.points_total}</td>
-      <td class="right">\${m.held_points}</td>
-      <td class="right"><strong>\${m.available_points}</strong></td>
-    </tr>\`).join("");
+  document.getElementById("membersTbody").innerHTML = data.members.map(function(m){
+    return '<tr><td title="'+m.nickname+'"><strong>'+m.nickname+'</strong></td><td class="right">'+m.points_total+'</td><td class="right">'+m.held_points+'</td><td class="right"><strong>'+m.available_points+'</strong></td></tr>';
+  }).join("");
 
-  document.getElementById("itemsTbody").innerHTML = data.items.map(i=>\`
-    <tr>
-      <td title="\${i.name}"><strong>\${i.name}</strong></td>
-      <td>\${i.status}</td>
-      <td title="\${i.highest_nickname ?? "-"}">\${i.highest_nickname ?? "-"}</td>
-      <td class="right">\${i.highest_amount ?? "-"}</td>
-    </tr>\`).join("");
+  document.getElementById("itemsTbody").innerHTML = data.items.map(function(i){
+    var t = i.highest_time ? toUtc7HHMM(i.highest_time) : "-";
+    return '<tr><td title="'+i.name+'"><strong>'+i.name+'</strong></td><td>'+i.status+'</td><td title="'+(i.highest_nickname||"-")+'">'+(i.highest_nickname||"-")+'</td><td class="right">'+(i.highest_amount||"-")+'</td><td class="colTime">'+t+'</td></tr>';
+  }).join("");
 
-  document.getElementById("finalsTbody").innerHTML = (data.finals || []).map(f=>\`
-    <tr>
-      <td title="\${f.item_name}"><strong>\${f.item_name}</strong></td>
-      <td title="\${f.winner}">\${f.winner}</td>
-      <td class="right"><strong>\${f.amount}</strong></td>
-      <td title="\${f.finalized_at}">\${(f.finalized_at||"").slice(11,16)}</td>
-    </tr>\`).join("") || \`<tr><td colspan="4">Belum ada finalize.</td></tr>\`;
+  var finalsHtml = (data.finals || []).map(function(f){
+    return '<tr><td title="'+f.item_name+'"><strong>'+f.item_name+'</strong></td><td title="'+f.winner+'">'+f.winner+'</td><td class="right"><strong>'+f.amount+'</strong></td><td class="colTime" title="'+f.finalized_at+'">'+toUtc7HHMM(f.finalized_at)+'</td></tr>';  }).join("");
+  if(!finalsHtml) finalsHtml = '<tr><td colspan="4">Belum ada finalize.</td></tr>';
+  document.getElementById("finalsTbody").innerHTML = finalsHtml;
 
-  document.getElementById("lastUpdated").textContent = "Updated: " + timeNow();
+  document.getElementById("lastUpdated").textContent = "Updated: " + timeNowUtc7();
   updateHighestForSelectedItem();
 
-  if(ME?.is_admin){
+  // jangan ganggu form admin saat auto refresh
+  if(!tablesOnly && ME && ME.is_admin){
     populateAdminDropdowns();
     await loadBidLog();
   }
 }
 
-function updateHighestForSelectedItem(){
-  const itemName = document.getElementById('item').value;
-  const found = DASH?.items?.find(x=>x.name===itemName);
-  document.getElementById("highest").textContent =
-    (found && found.highest_amount) ? (found.highest_amount + " (" + found.highest_nickname + ")") : "-";
-}
-
 async function refreshAll(){
   await loadMe();
   await loadOptions();
-  await loadDashboard();
+  await loadDashboard(false);
   toast("ok","Data berhasil direfresh.");
 }
 
@@ -864,14 +1035,17 @@ async function placeBid(){
   const amount = parseInt(document.getElementById('amount').value, 10);
   if(!itemName) return toast("err","Tidak ada item OPEN.");
 
-  const resp = await fetch('/api/bid', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({itemName,amount})});
+  const resp = await fetch('/api/bid', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({itemName:itemName,amount:amount})});
   const data = await resp.json();
   if(!resp.ok){ toast("err", data.error || "Gagal bid."); await refreshAll(); return; }
   toast("ok", data.message || "Bid diterima!");
   await refreshAll();
 }
 
-async function logout(){ await fetch('/api/logout', {method:'POST'}); location.href='/login'; }
+async function logout(){
+  await fetch('/api/logout', {method:'POST'});
+  location.href='/login';
+}
 
 // ---------- Admin ----------
 async function openAdmin(){
@@ -890,23 +1064,10 @@ async function adminLogout(){
   await refreshAll();
 }
 
-function populateAdminDropdowns(){
-  const members = DASH?.members || [];
-  const itemsAll = DASH?.items || [];
-  const itemsOpen = itemsAll.filter(i=>i.status==="OPEN");
-
-  const memOptions = members.map(m=>\`<option value="\${m.nickname}">\${m.nickname}</option>\`).join("");
-  document.getElementById("adminMember").innerHTML = memOptions;
-  document.getElementById("delMember").innerHTML = memOptions;
-
-  document.getElementById("finalizeItem").innerHTML = itemsOpen.map(i=>\`<option value="\${i.name}">\${i.name}</option>\`).join("");
-  document.getElementById("delItem").innerHTML = itemsAll.map(i=>\`<option value="\${i.name}">\${i.name}</option>\`).join("");
-}
-
 async function addMember(){
   const nickname = document.getElementById("newMember").value.trim();
   const points_total = parseInt(document.getElementById("newMemberPoints").value,10);
-  const resp = await fetch('/api/admin/add-member',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nickname,points_total})});
+  const resp = await fetch('/api/admin/add-member',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nickname:nickname,points_total:points_total})});
   const data = await resp.json();
   if(!resp.ok) return toast("err", data.error || "Gagal tambah member.");
   toast("ok", data.message || "Member ditambah.");
@@ -917,7 +1078,7 @@ async function addMember(){
 async function deleteMember(){
   const nickname = document.getElementById("delMember").value;
   if(!confirm("Yakin hapus member: " + nickname + " ?")) return;
-  const resp = await fetch('/api/admin/delete-member',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nickname})});
+  const resp = await fetch('/api/admin/delete-member',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nickname:nickname})});
   const data = await resp.json();
   if(!resp.ok) return toast("err", data.error || "Gagal hapus member.");
   toast("ok", data.message || "Member dihapus.");
@@ -927,7 +1088,7 @@ async function deleteMember(){
 async function setPoints(){
   const nickname = document.getElementById("adminMember").value;
   const points_total = parseInt(document.getElementById("adminPoints").value,10);
-  const resp = await fetch('/api/admin/set-points',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nickname,points_total})});
+  const resp = await fetch('/api/admin/set-points',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nickname:nickname,points_total:points_total})});
   const data = await resp.json();
   if(!resp.ok) return toast("err", data.error || "Gagal set poin.");
   toast("ok", data.message || "Poin tersimpan.");
@@ -936,7 +1097,7 @@ async function setPoints(){
 
 async function addItem(){
   const name = document.getElementById("newItem").value.trim();
-  const resp = await fetch('/api/admin/add-item',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  const resp = await fetch('/api/admin/add-item',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})});
   const data = await resp.json();
   if(!resp.ok) return toast("err", data.error || "Gagal tambah item.");
   toast("ok", data.message || "Item ditambah.");
@@ -947,45 +1108,37 @@ async function addItem(){
 async function deleteItem(){
   const itemName = document.getElementById("delItem").value;
   if(!confirm("Yakin hapus item: " + itemName + " ?")) return;
-  const resp = await fetch('/api/admin/delete-item',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({itemName})});
+  const resp = await fetch('/api/admin/delete-item',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({itemName:itemName})});
   const data = await resp.json();
   if(!resp.ok) return toast("err", data.error || "Gagal hapus item.");
   toast("ok", data.message || "Item dihapus.");
   await refreshAll();
 }
 
+async function deleteAllItems(){
+  if(!confirm("INI AKAN MENGHAPUS SEMUA ITEMS + BIDS + HOLDS + FINALS. Lanjut?")) return;
+  const resp = await fetch('/api/admin/delete-all-items?confirm=YES', {method:'POST'});
+  const data = await resp.json();
+  if(!resp.ok) return toast("err", data.error || "Gagal delete all items.");
+  toast("ok", data.message || "Semua item dibersihkan.");
+  await refreshAll();
+}
+
 async function finalizeSelected(){
   const itemName = document.getElementById("finalizeItem").value;
   if(!itemName) return toast("err","Tidak ada item OPEN untuk finalize.");
-  const resp = await fetch('/api/admin/finalize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({itemName})});
+  const resp = await fetch('/api/admin/finalize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({itemName:itemName})});
   const data = await resp.json();
   if(!resp.ok) return toast("err", data.error || "Gagal finalize.");
   toast("ok", data.message || "Finalize berhasil.");
   await refreshAll();
 }
 
-async function loadBidLog(){
-  const itemName = document.getElementById("finalizeItem")?.value;
-  const tbody = document.getElementById("logTbody");
-  if(!tbody) return;
-  if(!itemName){ tbody.innerHTML = \`<tr><td colspan="3">Pilih item OPEN untuk melihat log.</td></tr>\`; return; }
-
-  const resp = await fetch('/api/admin/bids?itemName='+encodeURIComponent(itemName));
-  const data = await resp.json();
-  if(!resp.ok){ tbody.innerHTML = \`<tr><td colspan="3">Gagal memuat log.</td></tr>\`; return; }
-
-  tbody.innerHTML = (data.bids||[]).map(b=>\`
-    <tr>
-      <td title="\${b.created_at}">\${b.created_at}</td>
-      <td title="\${b.nickname}"><strong>\${b.nickname}</strong></td>
-      <td class="right">\${b.amount}</td>
-    </tr>\`).join("") || \`<tr><td colspan="3">Belum ada bid.</td></tr>\`;
-}
-
 async function saveDeadline(){
-  const localVal = document.getElementById("deadlineLocal").value; // UTC+8
-  const deadline_utc = toUtcIsoFromUtc8LocalInput(localVal);
-  const resp = await fetch('/api/admin/set-deadline',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({deadline_utc})});
+  // input datetime-local dianggap UTC+7 => kirim ISO UTC Z
+  const localVal = document.getElementById("deadlineLocal").value;
+  const deadline_utc = toUtcIsoFromUtc7LocalInput(localVal);
+  const resp = await fetch('/api/admin/set-deadline',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({deadline_utc:deadline_utc})});
   const data = await resp.json();
   if(!resp.ok) return toast("err", data.error || "Gagal simpan deadline.");
   toast("ok", data.message || "Deadline tersimpan.");
@@ -1000,7 +1153,7 @@ async function clearDeadline(){
   await refreshAll();
 }
 
-document.addEventListener("change",(e)=>{
+document.addEventListener("change",function(e){
   if(e.target && e.target.id==="item") updateHighestForSelectedItem();
   if(e.target && e.target.id==="finalizeItem") loadBidLog();
 });
@@ -1009,8 +1162,13 @@ document.addEventListener("change",(e)=>{
 async function boot(){
   await loadMe();
   await loadOptions();
-  await loadDashboard();
-  setInterval(async ()=>{ await loadMe(); await loadDashboard(); }, 10000);
+  await loadDashboard(false);
+
+  // auto refresh: hanya tabel, tidak reset form admin
+  setInterval(async function(){
+    await loadMe();
+    await loadDashboard(true);
+  }, 10000);
 }
 boot();
 </script>
