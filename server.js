@@ -578,6 +578,17 @@ td.colTime{
   font-variant-numeric: tabular-nums;
 }
 .right{text-align:right}.divider{height:12px}.footer{margin-top:10px;font-size:12px;color:rgba(255,255,255,0.45);text-align:center}
+.madeby{
+  margin-top: 10px;
+  font-size: 12px;
+  color: rgba(255,255,255,0.40);
+  text-align: center;
+  user-select: none;
+}
+.madeby span{
+  color: rgba(255,255,255,0.55);
+}
+
 .adminBox{margin-top:12px;padding:12px;border-radius:16px;border:1px solid rgba(245,158,11,0.22);background:rgba(245,158,11,0.08);display:none}
 .adminTitle{font-weight:900;margin:0 0 10px;font-size:13px;color:rgba(255,255,255,0.9)}
 .smallNote{font-size:12px;color:rgba(255,255,255,0.65);margin-top:6px}
@@ -602,8 +613,8 @@ td.colTime{
     <div class="brand">
       <div class="logo"></div>
       <div>
-        <h1>Guild Bid System</h1>
-        <div class="sub">Dark mode · Auto hold/refund · Real-time dashboard</div>
+        <h1>ISEKAI Guild Bid System</h1>
+        <div class="sub">Auto hold/refund · Real-time dashboard</div>
       </div>
     </div>
     <div class="userbox">
@@ -704,7 +715,6 @@ td.colTime{
       <div class="card-header">
         <div>
           <h2>Dashboard</h2>
-          <div class="desc">Tabel ramping (tanpa geser) + hasil finalize + deadline.</div>
         </div>
         <span class="badge" id="lastUpdated">Loading...</span>
       </div>
@@ -717,7 +727,7 @@ td.colTime{
               <th style="width:40%;">Nickname</th>
               <th class="right" style="width:20%;">Total</th>
               <th class="right" style="width:20%;">Held</th>
-              <th class="right" style="width:20%;">Avail</th>
+              <th class="right" style="width:20%;">Available</th>
             </tr></thead>
             <tbody id="membersTbody"></tbody>
           </table>
@@ -830,7 +840,11 @@ td.colTime{
           <button class="btn btn-secondary" onclick="adminLogout()">Keluar Admin Mode</button>
         </div>
 
-        <div class="footer">Auto refresh tabel setiap 10 detik (tidak mengganggu form admin).</div>
+        <div class="footer">Auto refresh setiap 10 detik.</div>
+<div class="madeby">
+  Made by <span>❤️</span> @irfaaan_jo
+</div>
+
       </div>
     </div>
   </div>
