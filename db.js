@@ -1,6 +1,9 @@
 const Database = require("better-sqlite3");
-const db = new Database("guild.db");
 
+const dbPath = process.env.DB_PATH || "./guild.db";
+const db = new Database(dbPath);
+
+// Init schema
 db.exec(`
 PRAGMA journal_mode = WAL;
 
@@ -22,39 +25,31 @@ CREATE TABLE IF NOT EXISTS bids (
   item_id INTEGER NOT NULL,
   member_id INTEGER NOT NULL,
   amount INTEGER NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY(item_id) REFERENCES items(id),
-  FOREIGN KEY(member_id) REFERENCES members(id)
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS holds (
   item_id INTEGER PRIMARY KEY,
   member_id INTEGER NOT NULL,
   amount INTEGER NOT NULL,
-  FOREIGN KEY(item_id) REFERENCES items(id),
-  FOREIGN KEY(member_id) REFERENCES members(id)
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
   token TEXT PRIMARY KEY,
   member_id INTEGER NOT NULL,
   expires_at TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY(member_id) REFERENCES members(id)
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- ✅ Finalize results (hasil pemenang final)
 CREATE TABLE IF NOT EXISTS finals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   item_id INTEGER NOT NULL UNIQUE,
   winner_member_id INTEGER NOT NULL,
   amount INTEGER NOT NULL,
-  finalized_at TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY(item_id) REFERENCES items(id),
-  FOREIGN KEY(winner_member_id) REFERENCES members(id)
+  finalized_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- ✅ Global settings (deadline close bid)
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -63,11 +58,15 @@ CREATE TABLE IF NOT EXISTS settings (
 INSERT OR IGNORE INTO settings(key, value) VALUES('bid_deadline_utc', '');
 `);
 
+// --- MIGRATION: add holds.created_at if missing (for existing DB) ---
+try {
+  db.exec("ALTER TABLE holds ADD COLUMN created_at TEXT NOT NULL DEFAULT (datetime('now'))");
+} catch (_) {
+  // ignore (already exists)
+}
+
 // Seed contoh (hapus kalau tidak perlu)
 const seedMember = db.prepare("INSERT OR IGNORE INTO members(nickname, points_total) VALUES(?, ?)");
-["Montana"].forEach((n, i) => seedMember.run(n, 160 + i * 20));
-
-const seedItem = db.prepare("INSERT OR IGNORE INTO items(name, status) VALUES(?, 'OPEN')");
-["Blueprint"].forEach((it) => seedItem.run(it));
+["Lucier"].forEach((n, i) => seedMember.run(n, 160 + i * 20));
 
 module.exports = db;
